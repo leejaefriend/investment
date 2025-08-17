@@ -18,7 +18,7 @@ pip install -U pip
 pip install -r requirements.txt
 
 # 3. Create .env from template
-copy .env.example .env
+copy .env .env
 # Fill: UPBIT_ACCESS, UPBIT_SECRET (and optionally Slack)
 ```
 
