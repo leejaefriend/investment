@@ -1,56 +1,34 @@
-import argparse, os, numpy as np
-from .broker.upbit_client import UpbitClient
-from .broker.broker import Broker
-from .data.ohlcv import get_ohlcv
-from .rl.environment import DailyOHLCVEnv
-from .rl.networks import make_actor
-import tensorflow as tf
+# upbit_rl/trade.py (핵심 추가/변경만)
+import time, os, numpy as np, tensorflow as tf
+from .notify.slack import SlackNotifier
+MIN_KRW = int(os.getenv("MIN_ORDER_KRW", "5000"))
+COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "60"))
 
-def main(args):
-    client = UpbitClient()
-    broker = Broker(client)
-    df = get_ohlcv(args.ticker, count=max(120, args.window+1))
-    env = DailyOHLCVEnv(df, fee=float(os.getenv("UPBIT_FEE","0.0005")), init_krw=1_000_000, window=args.window)
+last_trade_ts = 0
+notifier = SlackNotifier()
 
-    actor = make_actor(input_dim=env._state().shape[0])
-    actor_path = "models/actor_latest.h5"
-    if os.path.exists(actor_path):
-        actor = tf.keras.models.load_model(actor_path)
+# ... actor 로드/target_w 계산 동일 ...
+
+if abs(delta_w) > args.thresh:
+    amt = bal["total_value"] * abs(delta_w)
+    if amt < MIN_KRW:
+        print(f"Skip: below MIN_KRW ({amt:.0f} < {MIN_KRW})")
+    elif time.time() - last_trade_ts < COOLDOWN_SEC:
+        print("Skip: cooldown")
     else:
-        print(f"[warn] {actor_path} not found. Using untrained actor (outputs ~0.5).")
+        if delta_w > 0:
+            res = broker.place_market_buy(args.ticker, amt)
+            action_txt = f"BUY KRW {amt:.0f}"
+        else:
+            sell_qty = min((bal["total_value"] * (-delta_w)) / price, bal["coin_qty"])
+            res = broker.place_market_sell(args.ticker, sell_qty)
+            action_txt = f"SELL {sell_qty:.6f}"
 
-    # Build a recent sequence
-    s = env.reset()
-    states = [s]
-    for _ in range(args.window-1):
-        ns, _, _, _ = env.step(0.0)
-        states.append(ns)
-    seq = np.array([np.vstack(states)[-args.window:]])
-
-    target_w = float(actor.predict(seq, verbose=0)[0,0])
-    bal = broker.get_balance(args.ticker)
-    price = client.get_price(args.ticker)
-    curr_w = (bal["coin_qty"] * price) / max(1e-9, bal["total_value"])
-    delta_w = target_w - curr_w
-
-    print(f"target_w={target_w:.3f} curr_w={curr_w:.3f} delta={delta_w:.3f}")
-
-    if delta_w > args.thresh:
-        amt = bal["total_value"] * delta_w
-        print(f"Buying KRW {amt:.0f} @ {price:.0f}")
-        broker.place_market_buy(args.ticker, amt)
-    elif delta_w < -args.thresh:
-        sell_qty = (bal["total_value"] * (-delta_w)) / price
-        sell_qty = min(sell_qty, bal["coin_qty"])
-        print(f"Selling {sell_qty:.6f} units @ {price:.0f}")
-        broker.place_market_sell(args.ticker, sell_qty)
-    else:
-        print("No trade (within threshold).")
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--ticker", default=os.getenv("TICKER","KRW-BTC"))
-    p.add_argument("--window", type=int, default=30)
-    p.add_argument("--thresh", type=float, default=0.01, help="min abs delta weight to trade")
-    args = p.parse_args()
-    main(args)
+        last_trade_ts = time.time()
+        msg = (f"*Trade* {action_txt}\n"
+               f"- target_w: {target_w:.3f}, curr_w: {curr_w:.3f}\n"
+               f"- price: {price:.0f}, fee: {res.fee:.0f}\n"
+               f"- total: {bal['total_value']:.0f} → (post) ?")
+        notifier.send(msg)
+else:
+    print("No trade (within threshold).")
